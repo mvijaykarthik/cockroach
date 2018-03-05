@@ -17,10 +17,14 @@ package hlc
 import (
 	"context"
 	"fmt"
+	"os"
+	"regexp"
 	"testing"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/pkg/errors"
+	"github.com/stretchr/testify/assert"
 )
 
 type Event uint8
@@ -96,6 +100,370 @@ func TestHLCEqual(t *testing.T) {
 	if b == a {
 		t.Errorf("expected %+v < %+v", b, a)
 	}
+}
+
+// isErrSimilar returns true of the expected error is similar to the
+// actual error
+func isErrSimilar(expected *regexp.Regexp, actual error) bool {
+	if actual == nil {
+		if expected == nil {
+			return true
+		}
+		return false
+	}
+	// actual != nil
+	if expected != nil && expected.FindString(actual.Error()) != "" {
+		return true
+	}
+	return false
+}
+
+func TestHLCPhysicalClockJump(t *testing.T) {
+	var fatal bool
+	defer log.SetExitFunc(os.Exit)
+	log.SetExitFunc(func(r int) {
+		if r != 0 {
+			fatal = true
+		}
+	})
+
+	testCases := []struct {
+		name       string
+		actualJump time.Duration
+		maxJump    time.Duration
+		isFatal    bool
+	}{
+		{
+			name:       "small forward jump",
+			actualJump: 5 * time.Second,
+			maxJump:    50 * time.Second,
+			isFatal:    false,
+		},
+		{
+			name:       "large forward jump",
+			actualJump: 51 * time.Second,
+			maxJump:    50 * time.Second,
+			isFatal:    true,
+		},
+		{
+			name:       "large forward jump large thresh",
+			actualJump: 51 * time.Second,
+			maxJump:    70 * time.Second,
+			isFatal:    false,
+		},
+		{
+			name:       "small backward jump",
+			actualJump: -4 * time.Second,
+			maxJump:    50 * time.Second,
+			isFatal:    false,
+		},
+		{
+			name:       "large backward jump",
+			actualJump: -7 * time.Second,
+			maxJump:    50 * time.Second,
+			isFatal:    true,
+		},
+		{
+			name:       "large backward jump large thresh",
+			actualJump: -7 * time.Second,
+			maxJump:    90 * time.Second,
+			isFatal:    false,
+		},
+	}
+
+	maxJumpCh := make(chan time.Duration, 1)
+	defer close(maxJumpCh)
+
+	m := NewManualClock(1)
+	c := NewClock(m.UnixNano, time.Nanosecond)
+	var tickerDuration time.Duration
+	tickerCh := make(chan time.Time)
+	tickProcessedCh := make(chan struct{})
+	if err := c.StartMonitoringClockJumps(
+		maxJumpCh,
+		func(d time.Duration) *time.Ticker {
+			tickerDuration = d
+			ticker := time.NewTicker(d)
+			ticker.Stop()
+			ticker.C = tickerCh
+			return ticker
+		},
+		func() {
+			tickProcessedCh <- struct{}{}
+		},
+	); err != nil {
+		t.Error(err)
+		return
+	}
+
+	if err := c.StartMonitoringClockJumps(
+		maxJumpCh,
+		time.NewTicker,
+		nil, /* tick callback */
+	); !isErrSimilar(regexp.MustCompile("already being monitored"), err) {
+		t.Error("expected an error when starting monitor goroutine twice")
+	}
+
+	for _, test := range testCases {
+		t.Run(test.name, func(t *testing.T) {
+			a := assert.New(t)
+
+			maxJumpCh <- test.maxJump
+			<-tickProcessedCh
+
+			fatal = false
+			t1 := c.Now()
+			a.Equal(false, fatal)
+
+			m.Increment(int64(test.actualJump))
+			tickerCh <- time.Now()
+			<-tickProcessedCh
+
+			fatal = false
+			t2 := c.Now()
+			a.True(t1.Less(t2), fmt.Sprintf("expected %+v < %+v", t1, t2))
+			// This should not fatal as tickerCh has ticked
+			a.Equal(false, fatal)
+			// After ticker ticks, last physical time should be equal to physical now
+			lastPhysicalTime := c.lastPhysicalTime()
+			physicalNow := c.PhysicalNow()
+			a.Equal(lastPhysicalTime, physicalNow)
+
+			// Potentially a fatal jump depending on the test case
+			m.Increment(int64(test.actualJump))
+			t3 := c.Now()
+			a.True(t2.Less(t3), fmt.Sprintf("expected %+v < %+v", t2, t3))
+
+			a.True(
+				tickerDuration <= test.maxJump,
+				fmt.Sprintf(
+					"ticker duration %+v should be less than max jump %+v",
+					tickerDuration,
+					test.maxJump,
+				),
+			)
+		})
+	}
+}
+
+func TestEnsureInitialWallTimeMonotonicity(t *testing.T) {
+	testCases := []struct {
+		name                  string
+		initialFutureWallTime int64
+		clockStartTime        int64
+	}{
+		{
+			name: "lower future time",
+			initialFutureWallTime: 100,
+			clockStartTime:        1000,
+		},
+		{
+			name: "higher future time",
+			initialFutureWallTime: 10000,
+			clockStartTime:        1000,
+		},
+		{
+			name: "significantly higher future time",
+			initialFutureWallTime: 10000000000,
+			clockStartTime:        100,
+		},
+		{
+			name: "equal future time",
+			initialFutureWallTime: 10000,
+			clockStartTime:        10000,
+		},
+	}
+
+	for _, test := range testCases {
+		t.Run(test.name, func(t *testing.T) {
+			a := assert.New(t)
+			var persistedWallTime int64
+			m := NewManualClock(test.clockStartTime)
+			c := NewClock(m.UnixNano, time.Nanosecond)
+
+			var persistErr error
+			persistWallTimeFn := func(i int64) error {
+				persistedWallTime = i
+				return persistErr
+			}
+			sleepFn := func(d time.Duration) {
+				sleepDur := int64(d * 4 / 5)
+				if sleepDur == 0 {
+					sleepDur = 1
+				}
+				m.Increment(sleepDur)
+			}
+
+			wallTime1 := c.Now().WallTime
+			if test.clockStartTime < test.initialFutureWallTime {
+				a.True(
+					wallTime1 < test.initialFutureWallTime,
+					fmt.Sprintf(
+						"expected wall time %d < initial future time %d",
+						wallTime1,
+						test.initialFutureWallTime,
+					),
+				)
+			}
+
+			c.EnsureInitialWallTimeMonotonicity(
+				context.TODO(),
+				test.initialFutureWallTime,
+				persistWallTimeFn,
+				sleepFn,
+			)
+
+			wallTime2 := c.Now().WallTime
+			// After ensuring monotonicity, wall time should be greater than
+			// initial future time
+			a.True(
+				wallTime2 > test.initialFutureWallTime,
+				fmt.Sprintf(
+					"expected wall time %d > initial future time %d",
+					wallTime2,
+					test.initialFutureWallTime,
+				),
+			)
+
+			// the persisted future wall time should be greater than initial
+			// wall time
+			a.True(
+				persistedWallTime > test.initialFutureWallTime,
+				fmt.Sprintf(
+					"expected persisted wall time %d > initial future time %d",
+					persistedWallTime,
+					test.initialFutureWallTime,
+				),
+			)
+		})
+	}
+}
+
+func TestHLCPersistWallTime(t *testing.T) {
+	a := assert.New(t)
+	fatal := false
+	defer log.SetExitFunc(os.Exit)
+	log.SetExitFunc(func(r int) {
+		defer log.Flush()
+		if r != 0 {
+			fatal = true
+		}
+	})
+
+	m := NewManualClock(int64(1))
+	c := NewClock(m.UnixNano, time.Nanosecond)
+
+	var persistErr error
+	var persistedWallTime int64
+	persistWallTimeFn := func(i int64) error {
+		persistedWallTime = i
+		return persistErr
+	}
+
+	tickerCh := make(chan time.Time)
+	tickProcessedCh := make(chan struct{})
+	persistFutureWallTimeCh := make(chan bool, 1)
+	defer close(persistFutureWallTimeCh)
+	if err := c.StartPersistingFutureWallTime(
+		persistFutureWallTimeCh,
+		persistWallTimeFn,
+		func(d time.Duration) *time.Ticker {
+			ticker := time.NewTicker(d)
+			ticker.Stop()
+			ticker.C = tickerCh
+			return ticker
+		},
+		func() {
+			tickProcessedCh <- struct{}{}
+		},
+	); err != nil {
+		t.Error(err)
+		return
+	}
+	a.False(fatal)
+	fatal = false
+
+	if err := c.StartPersistingFutureWallTime(
+		persistFutureWallTimeCh,
+		persistWallTimeFn,
+		func(d time.Duration) *time.Ticker {
+			ticker := time.NewTicker(d)
+			ticker.Stop()
+			ticker.C = tickerCh
+			return ticker
+		},
+		func() {
+			tickProcessedCh <- struct{}{}
+		},
+	); !isErrSimilar(regexp.MustCompile("already being persisted"), err) {
+		t.Error("expected an error when starting persist goroutine twice")
+	}
+	a.False(fatal)
+	fatal = false
+
+	// persist a future time
+	m.Increment(100)
+	wallTime3 := c.Now().WallTime
+	persistFutureWallTimeCh <- true
+	<-tickProcessedCh
+	tickerCh <- time.Now()
+	<-tickProcessedCh
+	firstPersist := persistedWallTime
+	a.True(
+		persistedWallTime > wallTime3,
+		fmt.Sprintf(
+			"expected persisted wall time %d > wall time %d",
+			persistedWallTime,
+			wallTime3,
+		),
+	)
+	// ensure that in memory value and persisted value are same
+	a.Equal(c.futureWallTime(), persistedWallTime)
+	a.Equal(c.wallTimeToPersist(), persistedWallTime)
+	a.False(fatal)
+	fatal = false
+
+	// Increment clock by 100 and tick the timer. A persist should have happened
+	m.Increment(100)
+	tickerCh <- time.Now()
+	<-tickProcessedCh
+	a.True(
+		persistedWallTime == firstPersist+100,
+		fmt.Sprintf(
+			"expected persisted wall time %d to be 100 more than earlier persisted value %d",
+			persistedWallTime,
+			firstPersist,
+		),
+	)
+	a.Equal(c.futureWallTime(), persistedWallTime)
+	a.Equal(c.wallTimeToPersist(), persistedWallTime)
+	a.False(fatal)
+	fatal = false
+
+	// After disabling persistFutureWallTime, a value of 0 should be persisted
+	persistFutureWallTimeCh <- false
+	<-tickProcessedCh
+	a.Equal(
+		int64(0),
+		c.futureWallTime(),
+	)
+	a.Equal(int64(0), persistedWallTime)
+	a.Equal(int64(0), c.futureWallTime())
+	a.False(fatal)
+	fatal = false
+
+	persistFutureWallTimeCh <- true
+	<-tickProcessedCh
+	m.Increment(100)
+	tickerCh <- time.Now()
+	<-tickProcessedCh
+	// If persisting fails, a fatal error is expected
+	persistErr = errors.New("test err")
+	fatal = false
+	tickerCh <- time.Now()
+	<-tickProcessedCh
+	a.NotEmpty(c.wallTimeToPersist(), persistedWallTime)
+	a.True(fatal)
 }
 
 // TestHLCClock performs a complete test of all basic phenomena,
