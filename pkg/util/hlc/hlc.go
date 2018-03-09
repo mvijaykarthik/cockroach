@@ -27,6 +27,19 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/pkg/errors"
+)
+
+const (
+	// The following constants are used if server.hlc.persist_future_wall_time
+	// is true
+
+	// persistFutureWallTimeInterval is the interval used for persisting the
+	// future wall time
+	persistFutureWallTimeInterval = 400 * time.Millisecond
+	// persistFutureWallTimeDelta is the delta used to compute the future wall
+	// time. This should be greater than persistFutureWallTimeInterval
+	persistFutureWallTimeDelta = int64(15 * time.Second)
 )
 
 // TODO(Tobias): Figure out if it would make sense to save some
@@ -69,6 +82,23 @@ type Clock struct {
 		// lastPhysicalTime reports the last measured physical time. This
 		// is used to detect clock jumps.
 		lastPhysicalTime int64
+
+		// maxClockJump is the maximum jump allowed for the physical clock between
+		// two successive clock reads. Setting this to 0 disables this validation.
+		maxClockJump time.Duration
+
+		// isMonitoringClockJumps is a flag to ensure that only one jump monitoring
+		// goroutine is running per clock
+		isMonitoringClockJumps bool
+
+		// futureWallTime is latest future wall time successfully persisted.
+		// The wall time used by the HLC will always be lesser than this timestamp.
+		// If this is set to 0, this validation is skipped
+		futureWallTime int64
+
+		// isPersistingFutureWallTime is a flag to ensure that only one persisting
+		// goroutine is running per clock
+		isPersistingFutureWallTime bool
 	}
 }
 
@@ -125,6 +155,164 @@ func NewClock(physicalClock func() int64, maxOffset time.Duration) *Clock {
 	}
 }
 
+// StartMonitoringClockJumps starts a goroutine to update the clock's
+// maxClockJump based on the values pushed in maxClockJumpCh.
+//
+// This also keeps lastPhysicalTime up to date to avoid spurious jump errors.
+// maxClockJumpCh is a channel from which the tolerated clock physical jump
+// threshold is read.
+//
+// A nil channel or a value of 0 for maxClockJump disables checking clock
+// jumps between two successive reads of the physical clock.
+//
+// This should only be called once per clock, and will return an error if called
+// more than once
+//
+// tickerFn is used to create a new ticker
+//
+// tickCallback is called whenever maxClockJumpCh or a ticker tick is processed
+func (c *Clock) StartMonitoringClockJumps(
+	maxClockJumpCh <-chan time.Duration,
+	tickerFn func(d time.Duration) *time.Ticker,
+	tickCallback func(),
+) error {
+	alreadyMonitoring := c.setMonitoringClockJump()
+	if alreadyMonitoring {
+		return errors.New("clock jumps are already being monitored")
+	}
+
+	go func() {
+		ticker := tickerFn(c.maxOffset)
+		ticker.Stop()
+		for {
+			select {
+			case maxClockJump, ok := <-maxClockJumpCh:
+				ticker.Stop()
+				if !ok {
+					return
+				}
+
+				refreshLastUpdateTimeItvl := maxClockJump / 2
+				if refreshLastUpdateTimeItvl > 0 {
+					ticker = tickerFn(refreshLastUpdateTimeItvl)
+				}
+				c.updateMaxClockJump(maxClockJump)
+			case <-ticker.C:
+				c.PhysicalNow()
+			}
+
+			if tickCallback != nil {
+				tickCallback()
+			}
+		}
+	}()
+	return nil
+}
+
+// wallTimeToPersist returns the wall time offset by persistFutureWallTimeDelta
+func (c *Clock) wallTimeToPersist() int64 {
+	return c.Now().WallTime + persistFutureWallTimeDelta
+}
+
+// EnsureInitialWallTimeMonotonicity sleeps till the wall time reaches
+// prevWallTime. prevWallTime > 0 implies we need to guarantee wall time
+// monotonicity across server restarts. prevWallTime is the last successfully
+// persisted timestamp greater then any wall time used by the server.
+//
+// persistWallTimeFn is used to persist the future wall time, and should return
+// an error if the persist fails.
+func (c *Clock) EnsureInitialWallTimeMonotonicity(
+	ctx context.Context,
+	prevWallTime int64,
+	persistWallTimeFn func(int64) error,
+	sleepFn func(d time.Duration),
+) error {
+	for {
+		delta := time.Duration(prevWallTime-c.Now().WallTime) + 1
+		if delta <= 0 {
+			break
+		}
+
+		log.Infof(ctx, "Sleeping for %v to catch up to wall clock time of %v",
+			delta, prevWallTime)
+		sleepFn(delta)
+	}
+
+	if prevWallTime > 0 {
+		// A non zero prevWallTime signifies that the feature to persist future
+		// wall times is enabled. Persist a new future wall time to continue
+		// guaranteeing monotonicity
+		return c.updateFutureWallTime(persistWallTimeFn, c.wallTimeToPersist())
+	}
+	return nil
+}
+
+// StartPersistingFutureWallTime starts a goroutine to persist a future wall time.
+// The values pushed in persistFutureWallTimeCh specify whether the future
+// timestamp should be persisted.
+//
+// persistWallTimeFn is used to persist the future wall time, and should return
+// an error if the persist fails
+//
+// tickerFn is used to create a new ticker
+//
+// tickCallback is called whenever maxClockJumpCh or a ticker tick is processed
+func (c *Clock) StartPersistingFutureWallTime(
+	persistFutureWallTimeCh <-chan bool,
+	persistWallTimeFn func(int64) error,
+	tickerFn func(d time.Duration) *time.Ticker,
+	tickCallback func(),
+) error {
+	alreadyPersisting := c.setPersistingFutureWallTime()
+	if alreadyPersisting {
+		return errors.New("future wall time is already being persisted")
+	}
+
+	go func() {
+		ticker := tickerFn(persistFutureWallTimeInterval)
+		ticker.Stop()
+
+		for {
+			select {
+			case persistFutureWallTime, ok := <-persistFutureWallTimeCh:
+				ticker.Stop()
+				if !ok {
+					return
+				}
+
+				if persistFutureWallTime {
+					ticker = tickerFn(persistFutureWallTimeInterval)
+				} else {
+					c.updateFutureWallTime(persistWallTimeFn, 0)
+				}
+
+			case <-ticker.C:
+				futureWallTime := c.wallTimeToPersist()
+				if err := c.updateFutureWallTime(persistWallTimeFn, futureWallTime); err != nil {
+					log.Fatalf(
+						context.Background(),
+						"error persisting future wall time of %d: %v",
+						futureWallTime,
+						err,
+					)
+				}
+			}
+
+			if tickCallback != nil {
+				tickCallback()
+			}
+		}
+	}()
+	return nil
+}
+
+// Tolerated offset is a value lower than maxOffset which is can be used in
+// validations
+func ToleratedOffset(maxOffset time.Duration) time.Duration {
+	// Tolerate up to 80% of the maximum offset.
+	return maxOffset * 4 / 5
+}
+
 // MaxOffset returns the maximal clock offset to any node in the cluster.
 //
 // A value of 0 means offset checking is disabled.
@@ -142,6 +330,37 @@ func (c *Clock) getPhysicalClockLocked() int64 {
 		if interval > int64(c.maxOffset/10) {
 			c.mu.monotonicityErrorsCount++
 			log.Warningf(context.TODO(), "backward time jump detected (%f seconds)", float64(-interval)/1e9)
+		}
+
+		// Physical time should not cross the persisted future wall time (if futureWallTime is set)
+		if c.mu.futureWallTime != 0 && c.mu.lastPhysicalTime > c.mu.futureWallTime {
+			log.Fatalf(
+				context.TODO(),
+				"Cluster setting server.hlc.persist_future_wall_time does not allow physical time "+
+					"%d to be greater than persisted wall time %d.",
+				c.mu.lastPhysicalTime,
+				c.mu.futureWallTime,
+			)
+		}
+
+		toleratedJump := int64(ToleratedOffset(c.mu.maxClockJump))
+		if toleratedJump > 0 {
+			if interval > int64(toleratedJump/10) {
+				log.Fatalf(
+					context.TODO(),
+					"detected backward time jump of %f seconds is not allowed with tolerance of %f seconds",
+					float64(interval)/1e9,
+					float64(c.mu.maxClockJump)/1e9,
+				)
+			}
+			if interval < -toleratedJump {
+				log.Fatalf(
+					context.TODO(),
+					"detected forward time jump of %f seconds is not allowed with tolerance of %f seconds",
+					float64(-interval)/1e9,
+					float64(c.mu.maxClockJump)/1e9,
+				)
+			}
 		}
 	}
 
@@ -250,4 +469,60 @@ func (c *Clock) UpdateAndCheckMaxOffset(rt Timestamp) (Timestamp, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.updateLocked(rt, false)
+}
+
+// updateMaxClockJump atomically sets maxClockJump
+func (c *Clock) updateMaxClockJump(maxClockJump time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.mu.maxClockJump = maxClockJump
+}
+
+// updateFutureWallTime persists the future wall time and updates the in memory value
+// if the persist succeeds
+func (c *Clock) updateFutureWallTime(persistFn func(int64) error, futureWallTime int64) error {
+	if err := persistFn(futureWallTime); err != nil {
+		return err
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.mu.futureWallTime = futureWallTime
+	return nil
+}
+
+// futureWallTime returns the in memory value of future wall time
+func (c *Clock) futureWallTime() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.mu.futureWallTime
+}
+
+// lastPhysicalTime returns the last physical time
+func (c *Clock) lastPhysicalTime() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.mu.lastPhysicalTime
+}
+
+// setMonitoringClockJump atomically sets isMonitoringClockJumps to true and
+// returns the old value. This is used to ensure that only one monitoring
+// goroutine is launched
+func (c *Clock) setMonitoringClockJump() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	isMonitoring := c.mu.isMonitoringClockJumps
+	c.mu.isMonitoringClockJumps = true
+	return isMonitoring
+}
+
+// setPersistingFutureWallTime atomically sets isMonitoringClockJumps to true
+// and returns the old value. This is used to ensure that only one persisting
+// goroutine is launched
+func (c *Clock) setPersistingFutureWallTime() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	isPersisting := c.mu.isPersistingFutureWallTime
+	c.mu.isPersistingFutureWallTime = true
+	return isPersisting
 }
